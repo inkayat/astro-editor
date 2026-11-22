@@ -1,6 +1,8 @@
 -- AstroEditor runtime: opens what one launch manifest asks for, using stock
--- Neovim commands only. The manifest's paths are data: they are checked and
--- escaped, never evaluated. This module never runs another program.
+-- Neovim commands only, and hands context messages to the destinations that
+-- manifest declares. The manifest's paths and the editor's text are data:
+-- they are checked and escaped, never evaluated. This module never runs
+-- another program.
 local M = {}
 
 local function fail(msg)
@@ -85,6 +87,43 @@ local function check_changes(list)
   end
 end
 
+-- Bounds on what one launch may declare and one context message may carry.
+local max_destinations = 16
+local max_text = 64 * 1024
+local max_note = 4 * 1024
+
+-- Returns nil or an error message for a manifest's `context` object.
+local function check_context(c)
+  if type(c) ~= 'table' or vim.islist(c) then
+    return 'context must be an object'
+  end
+  local err = check_path(c, 'outbox', is_dir, 'context.')
+  if err then
+    return err
+  end
+  local list = c.destinations
+  if type(list) ~= 'table' or #list == 0 or #list > max_destinations or not vim.islist(list) then
+    return ('context.destinations must be a list of 1 to %d destinations'):format(max_destinations)
+  end
+  local seen = {}
+  for i, d in ipairs(list) do
+    local at = ('context.destinations[%d]'):format(i)
+    if type(d) ~= 'table' then
+      return at .. ' must be an object'
+    end
+    if type(d.id) ~= 'string' or #d.id > 64 or not d.id:find('^[%w_.-]+$') then
+      return at .. '.id must be 1 to 64 letters, digits, ".", "_" or "-"'
+    end
+    if seen[d.id] then
+      return at .. '.id repeats ' .. d.id
+    end
+    seen[d.id] = true
+    if type(d.label) ~= 'string' or d.label == '' or #d.label > 80 or d.label:find('%c') then
+      return at .. '.label must be 1 to 80 bytes of text without control characters'
+    end
+  end
+end
+
 -- Returns nil or an error message. Unknown fields are ignored.
 function M.check(m)
   if type(m) ~= 'table' then
@@ -108,6 +147,9 @@ function M.check(m)
     err = check_changes(m.changes)
   else
     err = 'unknown kind: ' .. tostring(m.kind)
+  end
+  if not err and not absent(m.context) then
+    err = check_context(m.context)
   end
   return err
 end
@@ -202,6 +244,9 @@ local function open_changes(changes)
   vim.cmd('wincmd p')
 end
 
+-- The launch manifest's context destinations, once it has been opened.
+local context
+
 -- Opens a decoded manifest. Returns true, or false after notifying the error.
 function M.open(m)
   local err = M.check(m)
@@ -222,6 +267,7 @@ function M.open(m)
   else
     open_changes(m.changes)
   end
+  context = not absent(m.context) and m.context or nil
   return true
 end
 
@@ -235,6 +281,137 @@ function M.start(path)
     return false
   end
   return M.open(m)
+end
+
+-- Destination ids the launch declared, for command-line completion.
+function M.destination_ids()
+  return vim.tbl_map(function(d)
+    return d.id
+  end, context and context.destinations or {})
+end
+
+-- Captures the text a context message is about from the current buffer, as
+-- it is in the editor, saved or not: the last visual selection when the range
+-- is that selection, the range's lines for another range, else the cursor's
+-- location and line. Returns the message, or nil and an error message.
+local function capture(opts)
+  local buf = vim.api.nvim_get_current_buf()
+  local name = vim.api.nvim_buf_get_name(buf)
+  local msg = {
+    version = 1,
+    path = name ~= '' and name or vim.NIL,
+    filetype = vim.bo[buf].filetype,
+    modified = vim.bo[buf].modified,
+  }
+  local lines
+  if opts.range > 0 then
+    local from, to = vim.fn.getpos("'<"), vim.fn.getpos("'>")
+    if from[2] == opts.line1 and to[2] == opts.line2 then
+      lines = vim.fn.getregion(from, to, { type = vim.fn.visualmode() })
+    else
+      lines = vim.api.nvim_buf_get_lines(buf, opts.line1 - 1, opts.line2, true)
+    end
+    msg.kind, msg.line, msg.end_line = 'selection', opts.line1, opts.line2
+  else
+    local pos = vim.api.nvim_win_get_cursor(0)
+    lines = vim.api.nvim_buf_get_lines(buf, pos[1] - 1, pos[1], true)
+    msg.kind, msg.line, msg.col = 'location', pos[1], pos[2] + 1
+  end
+  msg.text = table.concat(lines, '\n')
+  if #msg.text > max_text then
+    return nil, ('%s too large to send: %d bytes, limit %d'):format(msg.kind, #msg.text, max_text)
+  end
+  return msg
+end
+
+-- Messages delivered by this editor; part of each message's file name.
+local sent = 0
+
+-- Hands `msg` to the launch's outbox as one new JSON file. The file appears
+-- whole: it is written under a dot name and then renamed. Returns nil or an
+-- error message.
+local function deliver(msg)
+  if not is_dir(context.outbox) then
+    return 'outbox is gone: ' .. context.outbox
+  end
+  sent = sent + 1
+  local name = ('context-%d-%d-%d.json'):format(vim.uv.os_getpid(), vim.uv.hrtime(), sent)
+  local tmp = context.outbox .. '/.' .. name .. '.tmp'
+  local fd, err = vim.uv.fs_open(tmp, 'wx', tonumber('600', 8))
+  if not fd then
+    return err
+  end
+  local ok
+  ok, err = vim.uv.fs_write(fd, vim.json.encode(msg) .. '\n')
+  vim.uv.fs_close(fd)
+  if ok then
+    ok, err = vim.uv.fs_rename(tmp, context.outbox .. '/' .. name)
+  end
+  if not ok then
+    vim.uv.fs_unlink(tmp)
+    return err
+  end
+end
+
+local function not_sent()
+  vim.notify('astro-editor: context not sent', vim.log.levels.INFO)
+end
+
+-- :AstroContext [destination]. Captures the selection or location, asks for
+-- the destination (unless given), an optional note and an explicit Send, and
+-- only then delivers one message. Escape at any prompt sends nothing.
+function M.send_context(opts)
+  if not context then
+    return fail('no context destinations: AstroApp declared none for this launch')
+  end
+  local msg, err = capture(opts)
+  if not msg then
+    return fail(err)
+  end
+  local function to(d)
+    vim.ui.input({ prompt = 'Note for ' .. d.label .. ' (optional): ' }, function(note)
+      if note == nil then
+        return not_sent()
+      end
+      if #note > max_note then
+        return fail(('note too long: %d bytes, limit %d'):format(#note, max_note))
+      end
+      local what = msg.kind == 'location' and ('line %d'):format(msg.line)
+        or ('lines %d-%d'):format(msg.line, msg.end_line)
+      local prompt = ('Send %s to %s?'):format(what, d.label)
+      vim.ui.select({ 'Send', 'Cancel' }, { prompt = prompt }, function(_, choice)
+        if choice ~= 1 then
+          return not_sent()
+        end
+        msg.destination, msg.note = d.id, note
+        local failed = deliver(msg)
+        if failed then
+          return fail('cannot send context to ' .. d.label .. ': ' .. failed)
+        end
+        vim.notify('astro-editor: context sent to ' .. d.label, vim.log.levels.INFO)
+      end)
+    end)
+  end
+  if opts.args ~= '' then
+    for _, d in ipairs(context.destinations) do
+      if d.id == opts.args then
+        return to(d)
+      end
+    end
+    return fail('destination not available: ' .. opts.args)
+  end
+  vim.ui.select(context.destinations, {
+    prompt = 'Send context to:',
+    format_item = function(d)
+      return d.label
+    end,
+  }, function(d)
+    if d then
+      to(d)
+    else
+      not_sent()
+    end
+  end)
 end
 
 return M

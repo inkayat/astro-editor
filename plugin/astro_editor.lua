@@ -3,6 +3,20 @@ if vim.g.loaded_astro_editor then
 end
 vim.g.loaded_astro_editor = true
 
+-- Refuses until a launch manifest declares context destinations.
+vim.api.nvim_create_user_command('AstroContext', function(opts)
+  require('astro_editor').send_context(opts)
+end, {
+  nargs = '?',
+  range = true,
+  desc = 'Send the selection or location to a destination AstroApp declared',
+  complete = function(lead)
+    return vim.tbl_filter(function(id)
+      return vim.startswith(id, lead)
+    end, require('astro_editor').destination_ids())
+  end,
+})
+
 local manifest = vim.env.ASTRO_EDITOR_MANIFEST
 if not manifest or manifest == '' then
   return

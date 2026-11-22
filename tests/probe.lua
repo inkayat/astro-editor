@@ -39,10 +39,12 @@ vim.schedule(function()
     out.line_count = vim.fn.line('$')
   end
   for _, keys in ipairs(vim.json.decode(vim.env.PROBE_KEYS or '[]')) do
-    vim.api.nvim_feedkeys(vim.keycode(keys), 'mx', false)
+    -- As typed: <Esc> at a prompt cancels as a person's <Esc> does.
+    vim.api.nvim_feedkeys(vim.keycode(keys), 'mtx', false)
     table.insert(out.steps, {
       keys = keys,
       errmsg = vim.v.errmsg,
+      message = vim.api.nvim_exec2('1messages', { output = true }).output,
       buf = vim.api.nvim_buf_get_name(0),
       line = vim.fn.line('.'),
       line_count = vim.fn.line('$'),
