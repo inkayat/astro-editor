@@ -197,7 +197,9 @@ for _, bad in ipairs({
   { why = 'wrong version', m = { version = 2, kind = 'files', root = root }, msg = 'unsupported manifest version' },
   { why = 'bad line', m = { version = 1, kind = 'file', path = notes, line = 0 }, msg = 'line must be a positive integer' },
   { why = 'empty change list', m = { version = 1, kind = 'changes', changes = {} }, msg = 'changes must be a non-empty list' },
-  { why = 'deleted file', m = { version = 1, kind = 'changes', changes = { { status = 'deleted', name = 'gone.txt', path = work, base = base } } }, msg = 'changes[1].status not supported: deleted' },
+  { why = 'unknown status', m = { version = 1, kind = 'changes', changes = { { status = 'copied', name = 'x', path = work, base = base } } }, msg = 'changes[1].status not supported: copied' },
+  { why = 'deleted with a path', m = { version = 1, kind = 'changes', changes = { { status = 'deleted', name = 'gone.txt', path = work, base = base } } }, msg = 'changes[1].path must be omitted' },
+  { why = 'deleted without base', m = { version = 1, kind = 'changes', changes = { { status = 'deleted', name = 'gone.txt' } } }, msg = 'changes[1].base must be an absolute path' },
   { why = 'name with a newline', m = { version = 1, kind = 'changes', changes = { { status = 'added', name = 'a\nb', path = added } } }, msg = 'changes[1].name must be non-empty text' },
   { why = 'missing changed file', m = { version = 1, kind = 'changes', changes = { changes[1], { status = 'added', name = 'nope', path = tmp .. '/nope' } } }, msg = 'cannot open changes[2].path' },
   { why = 'modified without base', m = { version = 1, kind = 'changes', changes = { { status = 'modified', name = 'x', path = added } } }, msg = 'changes[1].base must be an absolute path' },
@@ -210,6 +212,88 @@ for _, bad in ipairs({
     eq(1, #s.windows, 'windows')
   end)
 end
+
+-- A mixed list: a deleted file is compared with an empty read-only side that
+-- is no file, and an explicit null base on an added file means no base.
+local gone = { status = 'deleted', name = 'gone.txt', base = renamed_base }
+local mixed = {
+  { status = 'added', name = 'new %3.txt', path = added, base = vim.NIL },
+  gone,
+  changes[1],
+}
+
+local function deleted_layout(left)
+  return layout({
+    { name = left, type = '', diff = true, modifiable = false },
+    { name = '', type = 'quickfix', diff = false, modifiable = false },
+  })
+end
+
+case('changes: deleted file against an empty read-only side', { version = 1, kind = 'changes', changes = mixed }, function(s)
+  eq('', s.errmsg, 'errmsg')
+  eq(3, #s.qf.items, 'quickfix entries')
+  eq('deleted', s.qf.items[2].text, 'entry 2 status')
+  eq(added, s.buf, 'first change open')
+  eq(diff_layout('', added), layout(s.windows), 'added file against an empty buffer')
+  local want = {
+    { buf = '', idx = 2, left = renamed_base, lines = 60 },
+    { buf = work, idx = 3, left = base, lines = 200 },
+    { buf = '', idx = 2, left = renamed_base, lines = 60 },
+  }
+  eq(#want, #s.steps, 'steps')
+  for i, w in ipairs(want) do
+    local got = s.steps[i]
+    local what = 'after ' .. got.keys
+    eq('', got.errmsg, what .. ': errmsg')
+    eq(w.idx, got.qf_idx, what .. ': quickfix entry')
+    eq(w.buf, got.buf, what .. ': buffer')
+    local right = { name = w.buf, type = '', diff = true, modifiable = w.buf ~= '' }
+    eq(layout({
+      { name = w.left, type = '', diff = true, modifiable = false },
+      right,
+      { name = '', type = 'quickfix', diff = false, modifiable = false },
+    }), layout(got.windows), what .. ': layout')
+    eq(w.lines, got.left_lines, what .. ': whole base file shown')
+  end
+  eq(vim.inspect(renamed_base_lines), vim.inspect(vim.fn.readfile(renamed_base)), 'base file untouched')
+end, { ']q', ']q', '[q' })
+
+-- Showing a listed file by any means but a quickfix jump keeps the windows
+-- the person asked for.
+local function names(windows)
+  local list = {}
+  for i, w in ipairs(windows) do
+    list[i] = w.name .. (w.type ~= '' and ('<' .. w.type .. '>') or '')
+  end
+  return table.concat(list, '|')
+end
+
+case('changes: split, edit and alternate buffer are not quickfix jumps', { version = 1, kind = 'changes', changes = changes }, function(s)
+  eq(5, #s.steps, 'steps')
+  local function wins(i)
+    return names(s.steps[i].windows)
+  end
+  eq(base .. '|' .. work .. '|' .. '<quickfix>', names(s.windows), 'initial layout')
+  eq(base .. '|' .. work .. '|' .. work .. '|<quickfix>', wins(1), ':vsplit keeps the new window')
+  eq(work, s.steps[1].buf, ':vsplit current buffer')
+  eq(4, #s.steps[1].windows, ':vsplit window count')
+  eq(base .. '|' .. work .. '|' .. '<quickfix>', wins(2), 'after closing the split')
+  eq(added, s.steps[3].buf, ':edit another listed file')
+  eq(1, s.steps[3].qf_idx, ':edit does not move the quickfix list')
+  eq(3, #s.steps[3].windows, ':edit keeps the layout')
+  eq(base, s.steps[3].windows[1].name, ':edit leaves the diff base')
+  eq(work, s.steps[4].buf, '<C-^> returns to the first file')
+  eq(3, #s.steps[4].windows, '<C-^> keeps the layout')
+  eq(2, s.steps[5].qf_idx, ':cc 2 is a quickfix jump')
+  eq(added, s.steps[5].buf, ':cc 2 opens the entry')
+  eq(diff_layout('', added), layout(s.steps[5].windows), ':cc 2 shows its diff')
+end, {
+  ':vsplit<CR>',
+  ':close<CR>',
+  ':edit ' .. vim.fn.fnameescape(added) .. '<CR>',
+  '<C-^>',
+  ':cc 2<CR>',
+})
 
 vim.fn.delete(tmp, 'rf')
 if failures > 0 then

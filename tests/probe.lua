@@ -47,6 +47,7 @@ vim.schedule(function()
       line = vim.fn.line('.'),
       line_count = vim.fn.line('$'),
       qf_idx = vim.fn.getqflist({ idx = 0 }).idx,
+      left_lines = vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(vim.api.nvim_tabpage_list_wins(0)[1])),
       windows = windows(),
     })
   end

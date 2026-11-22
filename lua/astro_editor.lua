@@ -27,8 +27,13 @@ local function is_file(p)
   return vim.fn.filereadable(p) == 1
 end
 
--- Statuses a whole-file diff can show. A deleted file has no file to open.
-local statuses = { modified = true, renamed = true, added = true }
+-- Statuses a whole-file diff can show.
+local statuses = { modified = true, renamed = true, added = true, deleted = true }
+
+-- JSON null decodes to vim.NIL; a field that is null is absent.
+local function absent(v)
+  return v == nil or v == vim.NIL
+end
 
 -- Returns nil or an error message for a `changes` list.
 local function check_changes(list)
@@ -47,23 +52,29 @@ local function check_changes(list)
     if type(c.name) ~= 'string' or c.name == '' or c.name:find('%c') then
       return at .. 'name must be non-empty text without control characters'
     end
-    local err = check_path(c, 'path', is_file, at)
+    local err
+    if c.status == 'deleted' then
+      if not absent(c.path) then
+        return at .. 'path must be omitted for a deleted file'
+      end
+    else
+      err = check_path(c, 'path', is_file, at)
+    end
+    if not err then
+      if c.status == 'added' then
+        if not absent(c.base) then
+          return at .. 'base must be omitted for an added file'
+        end
+      else
+        err = check_path(c, 'base', is_file, at)
+      end
+    end
     if err then
       return err
     end
-    if c.status == 'added' then
-      if c.base ~= nil then
-        return at .. 'base must be omitted for an added file'
-      end
-    else
-      err = check_path(c, 'base', is_file, at)
-      if err then
-        return err
-      end
-    end
     -- One buffer per file: a repeat would make two entries share a window.
     for _, key in ipairs({ 'path', 'base' }) do
-      local real = c[key] and (vim.uv.fs_realpath(c[key]) or c[key])
+      local real = type(c[key]) == 'string' and (vim.uv.fs_realpath(c[key]) or c[key])
       if real then
         if seen[real] then
           return at .. key .. ' repeats a file already in the list: ' .. c[key]
@@ -141,30 +152,48 @@ local function show_change(c)
   end
   -- The previous change's file is hidden but stays diffed until :diffoff!.
   vim.cmd('diffoff!')
-  local left = diff_against(c.base)
+  local left = diff_against(type(c.base) == 'string' and c.base or nil)
   vim.bo[vim.api.nvim_win_get_buf(left)].bufhidden = 'wipe'
   shown = { left, win }
 end
 
--- Lists the changes in the quickfix list and opens the first one. Every
--- quickfix jump to a listed file (]q, [q, :cnext, <CR> in the list, ...)
--- shows that file's diff.
+-- An empty read-only buffer standing for the missing file of a deleted change.
+local function empty_buffer()
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].readonly = true
+  return buf
+end
+
+-- Lists the changes in the quickfix list and opens the first one. A quickfix
+-- jump that selects another listed entry (]q, [q, :cnext, <CR> in the list,
+-- ...) shows that entry's diff. Showing a listed file any other way (:split,
+-- :edit, <C-^>) leaves the windows alone.
 local function open_changes(changes)
   local items = {}
   for i, c in ipairs(changes) do
-    items[i] = { filename = c.path, module = c.name, lnum = 1, text = c.status }
+    items[i] = { module = c.name, lnum = 1, text = c.status }
+    if c.status == 'deleted' then
+      items[i].bufnr = empty_buffer()
+    else
+      items[i].filename = c.path
+    end
   end
   vim.fn.setqflist({}, ' ', { title = 'AstroEditor changes', items = items })
+  local list = vim.fn.getqflist({ id = 0 }).id
   local by_buf = {}
   for i, item in ipairs(vim.fn.getqflist()) do
-    by_buf[item.bufnr] = changes[i]
+    by_buf[item.bufnr] = i
   end
+  local shown_entry
   vim.api.nvim_create_autocmd('BufWinEnter', {
     group = vim.api.nvim_create_augroup('astro_editor_changes', {}),
     nested = true,
     callback = function(a)
-      if by_buf[a.buf] then
-        show_change(by_buf[a.buf])
+      local i = by_buf[a.buf]
+      if i and i ~= shown_entry and vim.fn.getqflist({ id = list, idx = 0 }).idx == i then
+        shown_entry = i
+        show_change(changes[i])
       end
     end,
   })

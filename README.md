@@ -54,15 +54,17 @@ line, invalid change entry) opens nothing and shows an `astro-editor:` error.
 
 Each `changes` entry is an object:
 
-- `status`: `modified`, `renamed` or `added`. Any other status is refused; a
-  deleted file, for example, has no file left to open.
+- `status`: `modified`, `renamed`, `added` or `deleted`. Any other status is
+  refused.
 - `name`: shown for the entry in the quickfix list, for example the file's
   path in the repository. Non-empty text without control characters; it is
   only displayed, never used as a path.
-- `path`: the changed file, opened editable on the right.
+- `path`: the changed file, opened editable on the right. Omitted for
+  `deleted`, which is compared with an empty read-only buffer.
 - `base`: the file before the change, read-only on the left. Required for
-  `modified` and `renamed`; omitted for `added`, which is compared with an
-  empty buffer.
+  `modified`, `renamed` and `deleted`; omitted for `added`, which is compared
+  with an empty buffer. An explicit `null` counts as omitted, for `path` and
+  `base` alike.
 
 A file may appear only once in the list, as a `path` or a `base`.
 
@@ -73,9 +75,10 @@ A file may appear only once in the list, as a `path` or a `base`.
 ] }
 ```
 
-Every quickfix jump to a listed file replaces the previous diff with that
-file's whole-file diff: `]q` / `[q` (`:cnext` / `:cprevious`), `<CR>` on an
-entry in the quickfix window, `:cfirst`, `:cc 2`. Inside a diff, `]c` / `[c`,
+A quickfix jump to another entry replaces the previous diff with that entry's
+whole-file diff: `]q` / `[q` (`:cnext` / `:cprevious`), `<CR>` on an entry in
+the quickfix window, `:cfirst`, `:cc 2`. Showing a listed file any other way
+(`:split`, `:edit`, `<C-^>`) leaves your windows alone. Inside a diff, `]c` / `[c`,
 `gg` / `G` and folds work as for `diff`. `:cclose` / `:copen` hide and show
 the list.
 
