@@ -51,6 +51,29 @@ local changes = {
   { status = 'renamed', name = 'sub dir/renamed,4.txt', path = renamed, base = renamed_base },
 }
 
+-- Context fixtures: a file to capture from and the destinations AstroApp
+-- declares. No worktree agent is declared, so it stays unavailable.
+local ctx_file = root .. '/ctx #5.txt'
+write(ctx_file, { 'one', 'two', 'three' })
+local destinations = {
+  { id = 'firstmate', label = 'Firstmate' },
+  { id = 'primary', label = 'Primary Assistant' },
+}
+
+-- A context object with `over` replacing its fields.
+local function ctx_with(over)
+  return { version = 1, kind = 'file', path = ctx_file, context = vim.tbl_extend('force', { outbox = root, destinations = destinations }, over) }
+end
+
+-- A `file` manifest for ctx_file whose context names a fresh, empty outbox.
+local outboxes = 0
+local function ctx_manifest()
+  outboxes = outboxes + 1
+  local outbox = ('%s/outbox %%#%d'):format(root, outboxes)
+  vim.fn.mkdir(outbox, 'p')
+  return ctx_with({ outbox = outbox }), outbox
+end
+
 local function launch(manifest, keys)
   local out = tmp .. '/probe.json'
   vim.fn.delete(out)
@@ -205,6 +228,15 @@ for _, bad in ipairs({
   { why = 'modified without base', m = { version = 1, kind = 'changes', changes = { { status = 'modified', name = 'x', path = added } } }, msg = 'changes[1].base must be an absolute path' },
   { why = 'added with base', m = { version = 1, kind = 'changes', changes = { { status = 'added', name = 'x', path = added, base = base } } }, msg = 'changes[1].base must be omitted' },
   { why = 'repeated file', m = { version = 1, kind = 'changes', changes = { changes[1], changes[1] } }, msg = 'changes[2].path repeats a file' },
+  { why = 'relative outbox', m = ctx_with({ outbox = 'out' }), msg = 'context.outbox must be an absolute path' },
+  { why = 'missing outbox', m = ctx_with({ outbox = tmp .. '/nope' }), msg = 'cannot open context.outbox' },
+  { why = 'no destinations', m = ctx_with({ destinations = {} }), msg = 'context.destinations must be a list of 1 to 16' },
+  { why = 'too many destinations', m = ctx_with({ destinations = vim.tbl_map(function(i)
+    return { id = 'd' .. i, label = 'D' .. i }
+  end, vim.fn.range(17)) }), msg = 'context.destinations must be a list of 1 to 16' },
+  { why = 'destination id with a slash', m = ctx_with({ destinations = { { id = '../x', label = 'X' } } }), msg = 'context.destinations[1].id must be' },
+  { why = 'repeated destination', m = ctx_with({ destinations = { destinations[1], destinations[1] } }), msg = 'context.destinations[2].id repeats firstmate' },
+  { why = 'destination label with a newline', m = ctx_with({ destinations = { { id = 'a', label = 'a\nb' } } }), msg = 'context.destinations[1].label must be' },
 }) do
   case('refuses ' .. bad.why, bad.m, function(s)
     assert(s.errmsg:find('astro-editor: ' .. bad.msg, 1, true), 'errmsg: ' .. s.errmsg)
@@ -294,6 +326,88 @@ end, {
   '<C-^>',
   ':cc 2<CR>',
 })
+
+-- The synthetic consumer: AstroApp's side of the outbox. Returns the messages
+-- by send order; every entry must be one whole, private message for a
+-- destination the launch declared.
+local function consume(outbox)
+  local declared = {}
+  for _, d in ipairs(destinations) do
+    declared[d.id] = true
+  end
+  local got = {}
+  for _, name in ipairs(vim.fn.readdir(outbox)) do
+    local seq = name:match('^context%-%d+%-%d+%-(%d+)%.json$')
+    assert(seq, 'unexpected outbox entry: ' .. name)
+    local file = outbox .. '/' .. name
+    eq(tonumber('600', 8), bit.band(vim.uv.fs_stat(file).mode, tonumber('777', 8)), name .. ' permissions')
+    local m = vim.json.decode(table.concat(vim.fn.readfile(file), '\n'))
+    assert(declared[m.destination], name .. ': undeclared destination ' .. tostring(m.destination))
+    got[tonumber(seq)] = m
+  end
+  return got
+end
+
+local ctx, ctx_outbox = ctx_manifest()
+case('context: sends the unsaved selection or location after an explicit Send', ctx, function(s)
+  local sent_to = { 'Primary Assistant', 'Firstmate', 'Primary Assistant' }
+  eq(#sent_to, #s.steps, 'steps')
+  for i, step in ipairs(s.steps) do
+    eq('', step.errmsg, 'step ' .. i .. ' errmsg')
+    eq('astro-editor: context sent to ' .. sent_to[i], step.message, 'step ' .. i .. ' message')
+  end
+  local got = consume(ctx_outbox)
+  eq(#sent_to, vim.tbl_count(got), 'one message per confirmed send')
+  local function want(fields)
+    return vim.inspect(vim.tbl_extend('error', { version = 1, path = ctx_file, filetype = 'text', modified = true }, fields))
+  end
+  eq(want({ destination = 'primary', kind = 'selection', line = 1, end_line = 2, text = 'ONE\ntw', note = 'look at "this" %s' }), vim.inspect(got[1]), 'charwise selection')
+  eq(want({ destination = 'firstmate', kind = 'location', line = 3, col = 2, text = 'three', note = '' }), vim.inspect(got[2]), 'location')
+  eq(want({ destination = 'primary', kind = 'selection', line = 2, end_line = 3, text = 'two\nthree', note = 'N' }), vim.inspect(got[3]), 'range')
+  eq(vim.inspect({ 'one', 'two', 'three' }), vim.inspect(vim.fn.readfile(ctx_file)), 'file on disk untouched')
+end, {
+  'ggcwONE<Esc>0vjl:AstroContext<CR>2<CR>look at "this" %s<CR>1<CR>', -- pick a destination, note, Send
+  'Gl:AstroContext firstmate<CR><CR>1<CR>', -- named destination, no note, Send
+  ':2,3AstroContext primary<CR>N<CR>1<CR>', -- a range that is not the visual selection
+})
+
+local quiet, quiet_outbox = ctx_manifest()
+case('context: nothing sent without an explicit Send', quiet, function(s)
+  local refused = {
+    [7] = 'destination not available: worktree-agent',
+    [8] = 'location too large to send: 70000 bytes, limit 65536',
+  }
+  eq(8, #s.steps, 'steps')
+  for i, step in ipairs(s.steps) do
+    local what = 'after ' .. step.keys
+    if refused[i] then
+      eq('astro-editor: ' .. refused[i], step.errmsg, what .. ': errmsg')
+    else
+      eq('', step.errmsg, what .. ': errmsg')
+      eq('astro-editor: context not sent', step.message, what .. ': message')
+    end
+  end
+  eq(0, #vim.fn.readdir(quiet_outbox), 'outbox entries')
+end, {
+  ':AstroContext<CR><Esc>', -- Escape at the destination
+  ':AstroContext<CR>9<CR>', -- a choice that is not in the list
+  ':AstroContext<CR>1<CR><Esc>', -- Escape at the note
+  ':AstroContext<CR>1<CR>note<CR><CR>', -- Enter alone at the confirmation
+  ':AstroContext<CR>1<CR>note<CR>2<CR>', -- Cancel
+  ':AstroContext<CR>1<CR>note<CR><Esc>', -- Escape at the confirmation
+  ':AstroContext worktree-agent<CR>', -- a destination the launch did not declare
+  ':call setline(1, repeat("x", 70000))<CR>:AstroContext firstmate<CR>', -- refused before any prompt
+})
+
+local gone, gone_outbox = ctx_manifest()
+case('context: refuses once the outbox is gone', gone, function(s)
+  eq('astro-editor: cannot send context to Firstmate: outbox is gone: ' .. gone_outbox, s.steps[1].errmsg, 'errmsg')
+  eq(0, vim.fn.isdirectory(gone_outbox), 'outbox not recreated')
+end, { (':lua vim.fn.delete(%q, "d")<CR>:AstroContext firstmate<CR><CR>1<CR>'):format(gone_outbox) })
+
+case('context: refused when the launch declared no destinations', { version = 1, kind = 'file', path = ctx_file }, function(s)
+  eq('astro-editor: no context destinations: AstroApp declared none for this launch', s.steps[1].errmsg, 'errmsg')
+end, { ':AstroContext<CR>' })
 
 vim.fn.delete(tmp, 'rf')
 if failures > 0 then
