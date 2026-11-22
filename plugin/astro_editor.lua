@@ -11,8 +11,10 @@ end
 vim.env.ASTRO_EDITOR_MANIFEST = nil
 
 -- Open after startup so the person's own config and plugins are already set up.
+-- Nested so opening files runs the usual autocommands (filetype, plugins, ...).
 vim.api.nvim_create_autocmd('VimEnter', {
   once = true,
+  nested = true,
   callback = function()
     require('astro_editor').start(manifest)
   end,
